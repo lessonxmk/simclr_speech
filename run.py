@@ -1,5 +1,5 @@
 import os
-
+import tensorflow as tf
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,6 +8,7 @@ import glob
 from absl import flags
 from absl import app
 import logging
+import numpy as np
 
 import dataloader
 import augment
@@ -32,7 +33,7 @@ flags.DEFINE_float(
     'Batch norm decay parameter.')
 
 flags.DEFINE_integer(
-    'train_batch_size', 512,
+    'train_batch_size', 32,
     'Batch size for training.')
 
 flags.DEFINE_string(
@@ -68,16 +69,12 @@ flags.DEFINE_string(
     'Loading from the given checkpoint for continued training or fine-tuning.')
 
 flags.DEFINE_string(
-    'model_dir', None,
-    'Model directory for training.')
-
-flags.DEFINE_string(
     'data_dir', None,
     'Directory where dataset is stored.')
 
-flags.DEFINE_string(
-    'log_dir', None,
-    'Directory where log is stored.')
+# flags.DEFINE_string(
+#     'log_dir', None,
+#     'Directory where log is stored.')
 
 flags.DEFINE_enum(
     'optimizer', 'lars', ['momentum', 'adam', 'lars'],
@@ -122,6 +119,15 @@ flags.DEFINE_integer(
 flags.DEFINE_integer(
     'load_checkpoint_step', None,
     'checkpoint step to load.')
+flags.DEFINE_integer(
+    'spec_height', 128,
+    'checkpoint step to load.')
+flags.DEFINE_integer(
+    'spec_width', 63,
+    'checkpoint step to load.')
+flags.DEFINE_float(
+    'color_jitter_strength', 1.0,
+    'The strength of color jittering.')
 
 
 def get_logger(filename, verbosity=1, name=None):
@@ -146,17 +152,37 @@ def get_logger(filename, verbosity=1, name=None):
 def loadDataPath(format='wav', *path):
     dataPath = []
     for p in path:
-        dataPath.append(glob.glob(p) + '.' + format)
-    return dataPath()
+        dataPath += glob.glob(p + '*.' + format)
+    return dataPath
 
 
 def Augment(x, *operations):
-    availableOperation = {
-        'crop': augment.crop,
-        'gwn': augment.Gaussian_white_noise,
-    }
     for op in operations:
-        x = availableOperation[op](x)
+        if (op == 'crop'):
+            def _random_crop_with_resize(x):
+                x = x.reshape(shape[1], shape[2], shape[3])
+                x = x.transpose(1, 2, 0)
+                x = augment.random_crop_with_resize(x, FLAGS.spec_height, FLAGS.spec_width)
+                x = tf.transpose(x, [2, 0, 1])
+                return x
+
+            shape = x.shape
+            x = x.reshape(shape[0], -1)
+            x = np.apply_along_axis(_random_crop_with_resize, 1, x)
+
+        if (op == 'color_jitter'):
+            def _random_color_jitter(x):
+                x = x.reshape(shape[1], shape[2], shape[3])
+                x = x.transpose(1, 2, 0)
+                x = augment.random_color_jitter(x)
+                x = tf.transpose(x, [2, 0, 1])
+                return x
+
+            shape = x.shape
+            x = x.reshape(shape[0], -1)
+            x = np.apply_along_axis(_random_color_jitter, 1, x)
+
+    x = torch.from_numpy(x)
     return x
 
 
@@ -171,7 +197,7 @@ def initial_optim(param, optimizer='lars', lr=0.3, momentum=0.9, weight_decay=1e
 
 def run(argv):
     logger = get_logger(FLAGS.log_dir)
-    train_data = loadDataPath()
+    train_data = loadDataPath('npy', FLAGS.data_dir)
     train_data = dataloader.DataSet(train_data)
     train_loader = DataLoader(train_data, batch_size=FLAGS.train_batch_size, shuffle=True)
     checkpoints = glob.glob(FLAGS.checkpoint + '*.pth')
@@ -185,29 +211,32 @@ def run(argv):
     else:
         encoder = model.Encoder()
         projectionHead = None
+
     if torch.cuda.is_available():
         encoder = encoder.cuda()
     criterion = model.contrastiveLoss(temperature=FLAGS.temperature, hidden_norm=FLAGS.hidden_norm)
     optimizerE = initial_optim(encoder.parameters(), optimizer=FLAGS.optimizer, lr=FLAGS.learning_rate,
                                momentum=FLAGS.momentum, weight_decay=FLAGS.weight_decay)
-    optimizerP = initial_optim(projectionHead.parameters(), optimizer=FLAGS.optimizer, lr=FLAGS.learning_rate,
-                               momentum=FLAGS.momentum, weight_decay=FLAGS.weight_decay)
+
     logger.info('Start training')
     step = 0
     for epoch in range(FLAGS.train_epochs):
         for _, x in enumerate(train_loader):
+            x = x.numpy()
+            x1 = Augment(x, 'crop', 'color_jitter')
+            x2 = Augment(x, 'crop', 'color_jitter')
             if torch.cuda.is_available():
-                x = x.cuda()
-
-            x1 = Augment(x)
-            x2 = Augment(x)
+                x1 = x1.cuda()
+                x2 = x2.cuda()
             x = torch.cat((x1, x2), 0)
-
             representation = encoder(x)
             if (projectionHead is None):
-                projectionHead = model.projectionHead(x.shape, FLAGS.head_proj_dim, FLAGS.head_proj_mode)
+                projectionHead = model.projectionHead(representation.shape, FLAGS.head_proj_dim, FLAGS.head_proj_mode)
                 if torch.cuda.is_available():
                     projectionHead = projectionHead.cuda()
+                optimizerP = initial_optim(projectionHead.parameters(), optimizer=FLAGS.optimizer,
+                                           lr=FLAGS.learning_rate,
+                                           momentum=FLAGS.momentum, weight_decay=FLAGS.weight_decay)
             out = projectionHead(representation)
 
             loss = criterion(out)
@@ -217,14 +246,19 @@ def run(argv):
             optimizerE.step()
             optimizerP.step()
 
-            step += 1
-            if (step % FLAGS.logging_steps):
+            if (step % FLAGS.logging_steps==0):
                 logger.info('step:{},loss:{}'.format(step, loss.data.item()))
             if (step % FLAGS.checkpoint_steps == 0):
                 logger.info('saving checkpoint-{}'.format(step))
                 torch.save(encoder.state_dict(), FLAGS.checkpoint + '-encoder-' + str(step) + '.pth')
                 torch.save(projectionHead.state_dict(), FLAGS.checkpoint + '-projectionHead-' + str(step) + '.pth')
+                ckpt_to_rm = int(step - FLAGS.keep_checkpoint_max * FLAGS.checkpoint_steps)
+                if (os.path.exists(FLAGS.checkpoint + '-encoder-' + str(ckpt_to_rm) + '.pth')):
+                    os.remove(FLAGS.checkpoint + '-encoder-' + str(ckpt_to_rm) + '.pth')
+                    os.remove(FLAGS.checkpoint + '-projectionHead-' + str(ckpt_to_rm) + '.pth')
+            step += 1
 
 
 if __name__ == '__main__':
-    app.run(run())
+    tf.enable_eager_execution()
+    app.run(run)

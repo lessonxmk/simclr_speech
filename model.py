@@ -2,13 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+import resnet
 
 
 class Encoder(nn.Module):
     def __init__(self, model='resnet18'):
         super(Encoder, self).__init__()
         if (model == 'resnet18'):
-            self.model = models.resnet18()
+            self.model = resnet.ResNet(resnet.ResidualBlock)
+        if(model=='resnet50'):
+            self.model=models.resnet50()
 
     def forward(self, *input):
         x = input[0]
@@ -22,7 +25,7 @@ class projectionHead(nn.Module):
         self.mode = mode
         if (self.mode == 'nonlinear'):
             self.mlp0 = nn.Linear(input_shape[-1], input_shape[-1])
-            self.nlp1 = nn.Linear(input_shape[-1], out_size)
+            self.mlp1 = nn.Linear(input_shape[-1], out_size)
 
     def forward(self, *input):
         x = input[0]
@@ -40,8 +43,8 @@ class contrastiveLoss(nn.Module):
                  weights=1.0,
                  LARGE_NUM=1e9):
         super().__init__()
-        self.hidden_norm = hidden_norm,
-        self.temperature = temperature,
+        self.hidden_norm = hidden_norm
+        self.temperature = temperature
         self.weights = weights
         self.LARGE_NUM = LARGE_NUM
 
@@ -54,7 +57,10 @@ class contrastiveLoss(nn.Module):
         hidden1_large = hidden1.transpose(1, 0)
         hidden2_large = hidden2.transpose(1, 0)
         labels = torch.arange(0, batch_size)
-        masks = F.one_hot(torch.arange(0, batch_size), batch_size)
+        masks = F.one_hot(torch.arange(0, batch_size), batch_size).float()
+        if torch.cuda.is_available():
+            labels = labels.cuda()
+            masks = masks.cuda()
 
         logits_aa = torch.matmul(hidden1, hidden1_large) / self.temperature
         logits_aa = logits_aa - masks * self.LARGE_NUM

@@ -260,5 +260,7 @@ def run(argv):
 
 
 if __name__ == '__main__':
-    tf.enable_eager_execution()
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth = True
+    tf.enable_eager_execution(config=config)
     app.run(run)

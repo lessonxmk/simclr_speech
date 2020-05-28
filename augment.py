@@ -256,3 +256,6 @@ def to_grayscale(image, keep_channels=True):
   if keep_channels:
     image = tf.tile(image, [1, 1, 3])
   return image
+
+def flip(image):
+    return tf.image.random_flip_left_right(image)
